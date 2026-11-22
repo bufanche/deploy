@@ -1,0 +1,23 @@
+name: test
+on:
+  push:
+  pull_request:
+jobs:
+  shellcheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck -s bash -S warning -e SC1090,SC1091,SC2034,SC1007,SC1111 deploy.sh
+  distros:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [debian:12, debian:13, ubuntu:20.04, ubuntu:22.04, ubuntu:24.04, alpine:3.18, alpine:3.22, rockylinux/rockylinux:9, almalinux:8, quay.io/centos/centos:stream9]
+    steps:
+      - uses: actions/checkout@v4
+      - name: 装客户端用的 sing-box
+        run: |
+          v=$(grep -m1 '^SB_VERSION=' deploy.sh | cut -d'"' -f2)
+          curl -fsSL https://github.com/SagerNet/sing-box/releases/download/v$v/sing-box-$v-linux-amd64-musl.tar.gz | sudo tar xz -C /usr/local/bin --strip-components=1 sing-box-$v-linux-amd64-musl/sing-box
+      - run: tests/docker-test.sh ${{ matrix.image }}

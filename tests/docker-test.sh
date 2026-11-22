@@ -3,7 +3,7 @@
 # 用法：tests/docker-test.sh debian:12 [更多镜像...]
 # 需要：docker、本机 sing-box（客户端）、jq、curl
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 . tests/lib.sh
 SNAP=$(mktemp); cp deploy.sh "$SNAP"; chmod 644 "$SNAP"   # 测试期间改脚本不影响本次测试
 
@@ -34,11 +34,11 @@ for img in "$@"; do
   test_all_clients "/tmp/$name.client.json" || FAIL=1
   # 管理命令：删一个、加回来、重跑同一条命令链接不变
   before=$(docker exec "$name" cat /etc/bfc/links.txt)
-  docker exec "$name" bfc del socks >/dev/null 2>&1 && docker exec "$name" grep -q socks5 /etc/bfc/links.txt && { echo "  ✗ bfc del"; FAIL=1; }
+  assert_deleted "$name" socks >/dev/null 2>&1 || { echo "  ✗ bfc del"; FAIL=1; }
   docker exec "$name" bfc add --socks=21011 >/dev/null 2>&1 || { echo "  ✗ bfc add"; FAIL=1; }
-  docker exec "$name" sh /root/deploy.sh $ALL --no-bbr >/dev/null 2>&1
+  docker exec "$name" sh /root/deploy.sh $ALL --no-bbr >/dev/null 2>&1 || { echo "  ✗ 重跑命令失败"; FAIL=1; }
   [ "$before" = "$(docker exec "$name" cat /etc/bfc/links.txt)" ] && echo "  ✓ 重跑链接不变" || { echo "  ✗ 重跑后链接变了"; FAIL=1; }
-  docker exec "$name" bfc uninstall -y >/dev/null 2>&1
+  docker exec "$name" bfc uninstall -y >/dev/null 2>&1 || { echo "  ✗ 卸载命令失败"; FAIL=1; }
   docker exec "$name" sh -c '[ ! -e /etc/bfc ] && [ ! -e /usr/local/bin/bfc-sing-box ]' && echo "  ✓ 卸载干净" || { echo "  ✗ 卸载有残留"; FAIL=1; }
   docker rm -f "$name" >/dev/null
 done

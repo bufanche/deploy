@@ -2,7 +2,7 @@
 # systemd、OpenRC 和系统防火墙这几条路径：普通容器里没有 init，要单独起带 init 的容器测
 # 用法：tests/init-test.sh
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 . tests/lib.sh
 SNAP=$(mktemp); cp deploy.sh "$SNAP"; chmod 644 "$SNAP"   # 测试期间改脚本不影响本次测试
 FAIL=0
@@ -10,7 +10,8 @@ ARGS="--reality=21001 --hy2=21002 --ss=21005 --no-bbr"
 ok()  { echo "  ✓ $*"; }
 bad() { echo "  ✗ $*"; FAIL=1; }
 
-run_case() { # $1 名字  $2 镜像  $3 容器启动命令  $4 准备命令  $5 检查服务命令  $6 检查防火墙命令  $7 卸载后防火墙应为空的检查
+run_case() { # $1 名字  $2 镜像  $3 容器启动命令  $4 准备命令  $5 检查服务命令  $6 检查防火墙命令  $7 卸载后防火墙规则检查
+  [ "${BFC_INIT_CASE:-$1}" = "$1" ] || return 0
   local name=bfc-init-$1
   echo "=== $1"
   docker rm -f $name >/dev/null 2>&1
@@ -44,10 +45,10 @@ run_case systemd-ufw bfc-systemd-ubuntu "" \
   "! ufw status | grep -q 2100"
 
 run_case systemd-firewalld rockylinux/rockylinux:9-ubi-init "" \
-  "dnf install -y -q firewalld && systemctl start firewalld" \
+  "dnf install -y -q firewalld && systemctl start firewalld && firewall-cmd -q --add-port=21001/tcp && firewall-cmd -q --permanent --add-port=21002/udp" \
   "systemctl is-active --quiet bfc" \
   "firewall-cmd --list-ports | grep -q '21001/tcp'" \
-  "! firewall-cmd --list-ports | grep -q 2100"
+  "firewall-cmd -q --query-port=21001/tcp && ! firewall-cmd -q --permanent --query-port=21001/tcp && firewall-cmd -q --permanent --query-port=21002/udp && ! firewall-cmd -q --query-port=21002/udp && ! firewall-cmd -q --query-port=21005/tcp && ! firewall-cmd -q --permanent --query-port=21005/tcp"
 
 run_case openrc alpine:3.22 "sleep infinity" \
   "apk add --no-cache openrc curl && mkdir -p /run/openrc && touch /run/openrc/softlevel && openrc default" \

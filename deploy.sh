@@ -9,6 +9,9 @@
 # 这一段用 POSIX sh 写，保证 Alpine 这类默认没有 bash 的系统也能先跑起来
 if [ -z "${BASH_VERSION:-}" ]; then
   if ! command -v bash >/dev/null 2>&1; then
+    for arg in "$@"; do
+      if [ "$arg" = --dry-run ]; then echo "预览需要 bash；请先手动安装 bash，本次没有改动系统" >&2; exit 1; fi
+    done
     echo "正在安装 bash ..."
     if command -v apk >/dev/null 2>&1; then apk add --no-cache bash >/dev/null
     elif command -v apt-get >/dev/null 2>&1; then apt-get update -qq && apt-get install -y -qq bash >/dev/null
@@ -154,6 +157,9 @@ install_deps() {
   local need=()
   command -v curl >/dev/null || need+=(curl)
   command -v tar >/dev/null || need+=(tar)
+  if ! command -v ip >/dev/null; then
+    case $PM in dnf|yum) need+=(iproute) ;; *) need+=(iproute2) ;; esac
+  fi
   [ -e /etc/ssl/certs/ca-certificates.crt ] || [ -e /etc/pki/tls/certs/ca-bundle.crt ] || need+=(ca-certificates)
   if [ ${#need[@]} -gt 0 ]; then
     info "安装依赖：${need[*]}"
@@ -183,14 +189,34 @@ port_used() {
   return 1
 }
 
-declare -A TAKEN=()
+declare -A TAKEN=() OWN_LISTENERS=()
+remember_listeners() {
+  local p port n net
+  OWN_LISTENERS=()
+  svc_active 2>/dev/null || return 0
+  for p in $(enabled_protos); do
+    port=$(port_of "$p"); net=${P_NET[$p]}
+    for n in tcp udp; do
+      [ "$net" = "$n" ] || [ "$net" = both ] || continue
+      OWN_LISTENERS[$port/$n]=1
+    done
+  done
+  [ -n "$STLS_INNER" ] && OWN_LISTENERS[$STLS_INNER/tcp]=1
+  [ -n "$ARGO_PORT" ] && OWN_LISTENERS[$ARGO_PORT/tcp]=1
+  return 0
+}
 port_free() { # 端口没被别的程序占、也没分给本次的其他协议
-  local port=$1 net=$2
+  local port=$1 net=$2 n
   case $net in
     both) [ -z "${TAKEN[$port/tcp]:-}" ] && [ -z "${TAKEN[$port/udp]:-}" ] ;;
     *) [ -z "${TAKEN[$port/$net]:-}" ] ;;
   esac || return 1
-  ! port_used "$port" "$net"
+  for n in tcp udp; do
+    [ "$net" = "$n" ] || [ "$net" = both ] || continue
+    if [ "${DRY_RUN:-0}" = 1 ] && [ -n "${OWN_LISTENERS[$port/$n]:-}" ]; then continue; fi
+    port_used "$port" "$n" && return 1
+  done
+  return 0
 }
 take_port() {
   local port=$1 net=$2
@@ -206,7 +232,7 @@ random_port() {
 }
 
 # ---------- 参数 ----------
-valid_port()   { [[ $1 =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+valid_port()   { [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
 valid_domain() { [[ $1 =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]; }
 
 # 解析协议和选项；ADD_MODE=1 时协议在原有基础上增加，否则替换为本次给出的协议
@@ -218,11 +244,11 @@ parse_flags() {
     case $k in
       --reality|--hy2|--tuic|--anytls|--ss|--shadowtls|--trojan|--vmess|--naive|--hysteria|--snell|--socks)
         k=${k#--}; proto_given=1
-        if [ -n "$v" ]; then valid_port "$v" || die "端口不对：$a"; WANT[$k]=$v; else WANT[$k]=auto; fi ;;
+        if [ -n "$v" ]; then valid_port "$v" || die "端口不对：$a"; WANT[$k]=$((10#$v)); else WANT[$k]=auto; fi ;;
       --argo-token) [[ $v =~ ^[A-Za-z0-9_=+/.-]{20,}$ ]] || die "Argo 令牌格式不对"; ARGO_TOKEN=$v; WANT[argo]=auto; proto_given=1 ;;
       --argo-domain) valid_domain "$v" || die "Argo 域名格式不对：$v"; ARGO_DOMAIN=$v ;;
       --domain) valid_domain "$v" || die "域名格式不对：$v"; DOMAIN=$v ;;
-      --email) [[ $v =~ ^[^@[:space:]]+@[^@[:space:]]+$ ]] || die "邮箱格式不对"; EMAIL=$v ;;
+      --email) [[ $v =~ ^[^@[:space:]]+@[^@[:space:]]+$ && $v != *\"* && $v != *\\* && $v != *[[:cntrl:]]* ]] || die "邮箱格式不对（不支持引号、反斜杠和控制字符）"; EMAIL=$v ;;
       --sni) valid_domain "$v" || die "SNI 格式不对：$v"; SNI=$v ;;
       --hy2-obfs) [[ $v =~ ^(salamander|gecko|none)$ ]] || die "--hy2-obfs 只能是 salamander、gecko 或 none"; HY2_OBFS=${v/none/} ;;
       --name) [[ $v =~ ^[A-Za-z0-9_.-]{1,24}$ ]] || die "--name 只能用英文、数字和 _.-，最长 24 个字符"; NAME=$v ;;
@@ -381,9 +407,28 @@ inbound_json() {
   esac
 }
 
+needs_cert() {
+  [ -n "$DOMAIN" ] || return 1
+  local p
+  for p in hy2 tuic anytls trojan vmess naive hysteria; do [ -n "$(port_of "$p")" ] && return 0; done
+  return 1
+}
+
 write_config() {
-  local p first=1 tags= certs=
-  [ -n "$DOMAIN" ] && certs="\"certificate_providers\":[{\"type\":\"acme\",\"tag\":\"cert\",\"domain\":[\"$DOMAIN\"],\"data_directory\":\"$DIR/acme\"${EMAIL:+,\"email\":\"$EMAIL\"}}],"
+  local p first=1 tags= certs= cidrs= addr addresses
+  if needs_cert; then
+    certs="\"certificate_providers\":[{\"type\":\"acme\",\"tag\":\"cert\",\"domain\":[\"$DOMAIN\"],\"disable_tls_alpn_challenge\":true,\"data_directory\":\"$DIR/acme\"${EMAIL:+,\"email\":\"$EMAIL\"}}],"
+  fi
+  # 同时覆盖直连公网接口、IPv4 映射地址和 NAT 后探测到的公网入口。
+  addresses=$(ip -o address show) || die "读取本机接口地址失败"
+  for addr in $( { echo "$addresses" | awk '{sub(/\/.*/,"",$4); print $4}'; printf '%s\n' "$IP4" "$IP6"; } | sort -u); do
+    if [[ $addr == *:* ]]; then
+      cidrs+="${cidrs:+,}\"$addr/128\""
+    else
+      cidrs+="${cidrs:+,}\"$addr/32\",\"::ffff:$addr/128\""
+    fi
+  done
+  [ -n "$cidrs" ] || die "没有取得本机地址，拒绝生成缺少本机访问限制的配置"
   {
     echo "{\"log\":{\"level\":\"warn\",\"timestamp\":true},$certs\"inbounds\":["
     for p in $(enabled_protos); do
@@ -394,13 +439,13 @@ write_config() {
     done
     # 代理用户不许访问服务器本机和内网（防止被拿来扫内网、碰本机管理面板）
     echo "],\"outbounds\":[{\"type\":\"direct\",\"tag\":\"direct\"}],"
-    echo "\"route\":{\"rules\":[{\"inbound\":[$tags],\"action\":\"resolve\",\"strategy\":\"prefer_ipv4\"},{\"inbound\":[$tags],\"ip_is_private\":true,\"action\":\"reject\"}]}}"
+    echo "\"route\":{\"rules\":[{\"inbound\":[$tags],\"action\":\"resolve\",\"strategy\":\"prefer_ipv4\"},{\"inbound\":[$tags],\"ip_is_private\":true,\"action\":\"reject\"},{\"inbound\":[$tags],\"ip_cidr\":[$cidrs],\"action\":\"reject\"}]}}"
   } > $CONF.tmp
-  $BIN format -c $CONF.tmp -w >/dev/null 2>&1
+  $BIN format -c $CONF.tmp -w >/dev/null 2>&1 || die "配置格式化失败"
   if ! $BIN check -c $CONF.tmp; then
     die "生成的配置没通过 sing-box 检查（上面是错误信息），请把这段截图发到 https://github.com/bufanche/deploy/issues"
   fi
-  chmod 600 $CONF.tmp; mv $CONF.tmp $CONF
+  chmod 600 $CONF.tmp && mv $CONF.tmp $CONF || die "配置写入失败"
 }
 
 # ---------- 服务 ----------
@@ -439,17 +484,29 @@ EOF
     none)
       # 没有 systemd / OpenRC（部分容器）：用 crontab 开机启动
       if command -v crontab >/dev/null; then
-        ( crontab -l 2>/dev/null | grep -v 'bfc-sing-box'; echo "@reboot $CMD start" ) | crontab -
+        { cron_without_bfc; echo "@reboot $CMD start # bfc-managed"; } | crontab -
       else
         warn "这个系统没有 systemd、OpenRC 和 crontab，重启服务器后需要手动输入 bfc start"
       fi ;;
   esac
 }
+cron_without_bfc() {
+  { crontab -l 2>/dev/null || true; } | awk -v cmd="$CMD" '
+    $1 == "@reboot" && $2 == cmd && $3 == "start" {next}
+    /# bfc-managed$/ {next}
+    {print}'
+}
 svc_active() {
   case $INIT in
     systemd) systemctl is-active --quiet bfc ;;
     openrc) rc-service bfc status >/dev/null 2>&1 ;;
-    none) [ -r /run/bfc.pid ] && kill -0 "$(cat /run/bfc.pid)" 2>/dev/null ;;
+    none)
+      [ -r /run/bfc.pid ] || return 1
+      local pid executable
+      pid=$(cat /run/bfc.pid)
+      [[ $pid =~ ^[1-9][0-9]*$ ]] && kill -0 "$pid" 2>/dev/null || return 1
+      executable=$(readlink "/proc/$pid/exe") || return 1
+      [[ $executable = "$BIN" || $executable = "$BIN (deleted)" ]] ;;
   esac
 }
 svc_start() {
@@ -462,10 +519,24 @@ svc_start() {
   if ! svc_active; then svc_log 20; die "sing-box 没能启动（上面是日志）"; fi
 }
 svc_stop() {
+  if ! svc_active; then
+    [ "$INIT" != none ] || rm -f /run/bfc.pid
+    return 0
+  fi
   case $INIT in
     systemd) systemctl stop bfc 2>/dev/null ;;
     openrc) rc-service bfc stop >/dev/null 2>&1 ;;
-    none) [ -r /run/bfc.pid ] && kill "$(cat /run/bfc.pid)" 2>/dev/null; rm -f /run/bfc.pid ;;
+    none)
+      if [ -r /run/bfc.pid ]; then
+        local pid i; pid=$(cat /run/bfc.pid)
+        kill "$pid" 2>/dev/null || true
+        for i in $(seq 1 50); do
+          kill -0 "$pid" 2>/dev/null || break
+          [ "$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null)" = Z ] && break
+          sleep 0.1
+        done
+      fi
+      rm -f /run/bfc.pid ;;
   esac
   return 0
 }
@@ -478,51 +549,105 @@ svc_remove() {
   case $INIT in
     systemd) systemctl disable bfc >/dev/null 2>&1; rm -f /etc/systemd/system/bfc.service; systemctl daemon-reload ;;
     openrc) rc-update del bfc default >/dev/null 2>&1; rm -f /etc/init.d/bfc ;;
-    none) command -v crontab >/dev/null && crontab -l 2>/dev/null | grep -v "$CMD start" | crontab - ;;
+    none) if command -v crontab >/dev/null; then cron_without_bfc | crontab -; fi ;;
   esac
 }
 
 # ---------- 防火墙 ----------
-# 只在系统防火墙确实开着时放行端口；放行过哪些记在状态文件里，卸载时撤回
-fw_open_all() {
-  local p port net n rules= tool=
-  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q 'Status: active'; then tool=ufw
-  elif command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then tool=firewalld
-  elif command -v iptables >/dev/null && iptables -S INPUT 2>/dev/null | grep -qE '^-P INPUT DROP|-j (REJECT|DROP)'; then tool=iptables
-  fi
-  [ -z "$tool" ] && { FW_RULES=; return; }
+# owned 标记仅用于新版实际新增的规则；旧状态无法证明所有权，保守保留。
+fw_ports() {
+  local p port net n
   for p in $(enabled_protos); do
-    net=${P_NET[$p]}; port=$(port_of $p)
-    [ "$net" = local ] && continue
+    net=${P_NET[$p]}; port=$(port_of "$p")
     for n in tcp udp; do
-      [ "$net" = both ] || [ "$net" = $n ] || continue
-      case $tool in
-        ufw) ufw allow $port/$n >/dev/null ;;
-        firewalld) firewall-cmd -q --permanent --add-port=$port/$n ;;
-        iptables) iptables -I INPUT -p $n --dport $port -j ACCEPT
-                  command -v ip6tables >/dev/null && ip6tables -I INPUT -p $n --dport $port -j ACCEPT 2>/dev/null ;;
-      esac
-      rules+="$tool:$port/$n "
+      [ "$net" = both ] || [ "$net" = "$n" ] || continue
+      echo "$port/$n"
     done
   done
-  [ $tool = firewalld ] && firewall-cmd -q --reload
-  [ $tool = iptables ] && command -v netfilter-persistent >/dev/null && netfilter-persistent save >/dev/null 2>&1
-  FW_RULES=$rules
-  info "已在系统防火墙（$tool）放行：$rules"
+  needs_cert && echo 80/tcp
+  return 0
+}
+fw_has() {
+  local tool=$1 pp=$2 port=${2%/*} n=${2#*/}
+  case $tool in
+    ufw4|ufw6) ufw status | awk -v pp="$pp" -v port="$port" -v family="$tool" '
+      {v6=($0 ~ /\(v6\)/); gsub(/\(v6\)/, "")}
+      ($1==pp || $1==port) && $2=="ALLOW" && $3=="Anywhere" && ((family=="ufw6")==v6) {found=1}
+      END {exit !found}' ;;
+    firewalld-runtime) firewall-cmd -q --query-port="$pp" ;;
+    firewalld-permanent) firewall-cmd -q --permanent --query-port="$pp" ;;
+    iptables|ip6tables) "$tool" -C INPUT -p "$n" --dport "$port" -m comment --comment bfc -j ACCEPT 2>/dev/null ;;
+  esac
+}
+fw_change() {
+  local op=$1 tool=$2 pp=$3 port=${3%/*} n=${3#*/}
+  case $tool in
+    ufw4|ufw6)
+      local any=0.0.0.0/0; [ "$tool" = ufw6 ] && any=::/0
+      if [ "$op" = add ]; then ufw allow proto "$n" from "$any" to "$any" port "$port" comment bfc >/dev/null
+      else ufw --force delete allow proto "$n" from "$any" to "$any" port "$port" >/dev/null; fi ;;
+    firewalld-runtime) firewall-cmd -q --"$op"-port="$pp" ;;
+    firewalld-permanent) firewall-cmd -q --permanent --"$op"-port="$pp" ;;
+    iptables|ip6tables)
+      local flag=-I; [ "$op" = remove ] && flag=-D
+      "$tool" "$flag" INPUT -p "$n" --dport "$port" -m comment --comment bfc -j ACCEPT ;;
+    *) return 1 ;;
+  esac
+}
+fw_persist() {
+  if command -v netfilter-persistent >/dev/null; then netfilter-persistent save >/dev/null; fi
+}
+fw_open_all() {
+  local tools= tool pp rule
+  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q 'Status: active'; then
+    tools=ufw4
+    if grep -qi '^IPV6=yes$' /etc/default/ufw; then tools+=" ufw6"; fi
+  elif command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then tools="firewalld-runtime firewalld-permanent"
+  else
+    for tool in iptables ip6tables; do
+      if command -v "$tool" >/dev/null && "$tool" -S INPUT 2>/dev/null | grep -qE '^-P INPUT DROP|-j (REJECT|DROP)'; then tools+=" $tool"; fi
+    done
+  fi
+  for tool in $tools; do
+    for pp in $(fw_ports | sort -u); do
+      rule="$tool-owned:$pp"
+      [[ " $FW_RULES " == *" $rule "* ]] && fw_has "$tool" "$pp" && continue
+      fw_has "$tool" "$pp" && continue
+      fw_change add "$tool" "$pp" || die "防火墙放行失败：$tool $pp"
+      FW_RULES+="${FW_RULES:+ }$rule"
+      TXN_ADDED_FW+=" $rule"
+    done
+  done
+  fw_persist
+  return 0
+}
+fw_remove_rules() {
+  local r tool pp
+  for r in $1; do
+    tool=${r%%:*}; pp=${r#*:}
+    if [[ $tool != *-owned ]]; then
+      warn "保留旧版未标记的防火墙规则 $r：无法确认是否由 bfc 创建，请手动核对"
+      continue
+    fi
+    tool=${tool%-owned}
+    fw_has "$tool" "$pp" || continue
+    fw_change remove "$tool" "$pp" || return 1
+    TXN_REMOVED_FW+=" $r"
+  done
+  fw_persist
+}
+fw_prune() {
+  local r keep= stale= desired
+  desired=" $(fw_ports | sort -u | tr '\n' ' ') "
+  for r in $FW_RULES; do
+    if [[ $r != *-owned:* ]] || [[ $desired == *" ${r#*:} "* ]]; then keep+=" $r"
+    else stale+=" $r"; fi
+  done
+  fw_remove_rules "$stale" || die "旧防火墙规则撤回失败"
+  FW_RULES=$keep
 }
 fw_close_all() {
-  local r tool pp port n
-  for r in $FW_RULES; do
-    tool=${r%%:*}; pp=${r#*:}; port=${pp%/*}; n=${pp#*/}
-    case $tool in
-      ufw) ufw delete allow $port/$n >/dev/null 2>&1 ;;
-      firewalld) firewall-cmd -q --permanent --remove-port=$port/$n 2>/dev/null ;;
-      iptables) iptables -D INPUT -p $n --dport $port -j ACCEPT 2>/dev/null
-                ip6tables -D INPUT -p $n --dport $port -j ACCEPT 2>/dev/null ;;
-    esac
-  done
-  [[ $FW_RULES == *firewalld:* ]] && firewall-cmd -q --reload
-  [[ $FW_RULES == *iptables:* ]] && command -v netfilter-persistent >/dev/null && netfilter-persistent save >/dev/null 2>&1
+  fw_remove_rules "$FW_RULES" || die "防火墙规则撤回失败，保留状态供重试"
   FW_RULES=
 }
 
@@ -592,13 +717,24 @@ check_time() {
 public_ip() {
   local v=$1 ip
   if [ $v = 4 ]; then
-    ip=$(curl -4 -s --max-time 5 https://1.1.1.1/cdn-cgi/trace | awk -F= '$1=="ip"{print $2}')
-    [ -z "$ip" ] && ip=$(curl -4 -s --max-time 5 https://api.ipify.org)
+    ip=$(curl -4 -s --max-time 5 https://1.1.1.1/cdn-cgi/trace | awk -F= '$1=="ip"{print $2}') || ip=
+    if [ -z "$ip" ]; then ip=$(curl -4 -s --max-time 5 https://api.ipify.org) || ip=; fi
   else
-    ip=$(curl -6 -s --max-time 5 'https://[2606:4700:4700::1111]/cdn-cgi/trace' | awk -F= '$1=="ip"{print $2}')
-    [ -z "$ip" ] && ip=$(curl -6 -s --max-time 5 https://api6.ipify.org)
+    ip=$(curl -6 -s --max-time 5 'https://[2606:4700:4700::1111]/cdn-cgi/trace' | awk -F= '$1=="ip"{print $2}') || ip=
+    if [ -z "$ip" ]; then ip=$(curl -6 -s --max-time 5 https://api6.ipify.org) || ip=; fi
+  fi
+  if [ "$v" = 4 ]; then
+    [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 0
+    local part; for part in ${ip//./ }; do (( 10#$part <= 255 )) || return 0; done
+  else
+    [[ $ip == *:* && $ip =~ ^[0-9a-fA-F:]+$ ]] || return 0
   fi
   echo "$ip"
+}
+discover_addresses() {
+  IP4=$(public_ip 4); IP6=$(public_ip 6)
+  [ -n "$IP4$IP6" ] || die "没查到本机公网 IP，已停止；请检查服务器到 Cloudflare / ipify 的连接"
+  [ "$IPV6" != 1 ] || [ -n "$IP6" ] || die "指定了 --ipv6，但没有检测到可用公网 IPv6"
 }
 b64() { base64 | tr -d '\n'; }
 host_addr() { if [ "$IPV6" = 1 ] || [ -z "$IP4" ]; then echo "[$IP6]"; else echo "$IP4"; fi; }
@@ -657,15 +793,13 @@ client_outbound() {
 }
 
 write_outputs() {
-  IP4=$(public_ip 4); IP6=$(public_ip 6)
-  [ -z "$IP4$IP6" ] && { warn "没查到本机公网 IP，链接里先用 127.0.0.1 代替，请自己改成服务器 IP"; IP4=127.0.0.1; }
   local p l first=1
   : > $DIR/links.txt
   for p in $(enabled_protos); do l=$(node_link $p); [ -n "$l" ] && echo "$l" >> $DIR/links.txt; done
   { echo '{"outbounds":['
     for p in $(enabled_protos); do [ $first = 1 ] || echo ","; first=0; client_outbound $p; done
     echo ']}'; } > $DIR/client.json
-  $BIN format -c $DIR/client.json -w >/dev/null 2>&1
+  $BIN format -c $DIR/client.json -w >/dev/null 2>&1 || die "客户端配置格式化失败"
   [ -n "$(port_of snell)" ] && echo "$NAME-Snell = snell, $(host_addr | tr -d '[]'), $(port_of snell), psk=$SNELL_PSK, version=5, reuse=true" > $DIR/surge.txt || rm -f $DIR/surge.txt
   chmod 600 $DIR/links.txt $DIR/client.json
 }
@@ -686,7 +820,7 @@ show_info() {
   [ -n "$(port_of shadowtls)" ] && echo "  ${D}ShadowTLS 没有通用链接，sing-box 客户端配置在 $DIR/client.json${N}"
   [ -z "$DOMAIN" ] && grep -qE '^(hysteria2|tuic|anytls|trojan|hysteria)://' $DIR/links.txt && \
     echo "  ${D}Hysteria2、TUIC、AnyTLS、Trojan 用的是自签证书，链接里已经带上“跳过证书验证”${N}"
-  [ -n "$DOMAIN" ] && echo "  ${D}证书由 sing-box 自动申请，第一次连接可能要等十几秒${N}"
+  if needs_cert; then echo "  ${D}证书由 sing-box 自动申请；云安全组需持续放行 TCP 80，用于签发和续期${N}"; fi
   step "下一步"
   echo "  1. 云服务商后台的安全组/防火墙放行上面的端口（甲骨文、AWS、谷歌云、阿里云、腾讯云都要手动放行）"
   echo "  2. 客户端怎么导入：https://bufanche.com/tools/deploy/#import"
@@ -714,7 +848,7 @@ print_plan() {
     if [ "$net" = local ]; then echo "  · ${P_NAME[$p]}：Cloudflare 隧道，域名 $ARGO_DOMAIN"
     else echo "  · ${P_NAME[$p]}：端口 $port/${net/both/tcp+udp}"; fi
   done
-  [ -n "$DOMAIN" ] && echo "  · 为 $DOMAIN 自动申请 Let's Encrypt 证书（用 80 端口验证）"
+  if needs_cert; then echo "  · 为 $DOMAIN 自动申请证书；持续放行 TCP 80 供签发和续期，云安全组也需要放行"; fi
   [ "$BBR" = 1 ] && echo "  · 开启 BBR + fq（写入 $SYSCTL_FILE）"
   [ -n "$TUNE" ] && echo "  · 按 ${TUNE%,*}Mbps / ${TUNE#*,}ms 调整 TCP 缓冲区"
   [ -n "$SWAP" ] && echo "  · 没有 swap 时创建 ${SWAP}MB swap（$SWAP_FILE）"
@@ -722,38 +856,123 @@ print_plan() {
   echo "  · 不上传任何数据，不改 SSH 设置"
 }
 
+# 配置、程序、服务定义一起保留；失败时恢复原状态，原来运行的服务会重新启动。
+TXN_ADDED_FW= TXN_REMOVED_FW=
+transaction_end() {
+  local status=$1 rollback_ok=1 i r tool pp removed=$TXN_REMOVED_FW
+  trap - EXIT INT TERM
+  set +e
+  if [ "$status" != 0 ] && [ "$TXN_READY" = 1 ]; then
+    warn "变更失败，正在恢复原配置和服务"
+    svc_stop || rollback_ok=0
+    fw_remove_rules "$TXN_ADDED_FW" || rollback_ok=0
+    for r in $removed; do
+      tool=${r%%:*}; tool=${tool%-owned}; pp=${r#*:}
+      fw_has "$tool" "$pp" || fw_change add "$tool" "$pp" || rollback_ok=0
+    done
+    fw_persist || rollback_ok=0
+    if [ ! -e "$TXN_DIR/path0" ]; then svc_remove || rollback_ok=0; fi
+    for i in "${!TXN_PATHS[@]}"; do
+      rm -rf "${TXN_PATHS[$i]}" || rollback_ok=0
+      if [ -e "$TXN_DIR/path$i" ] || [ -L "$TXN_DIR/path$i" ]; then
+        mkdir -p "$(dirname "${TXN_PATHS[$i]}")"
+        cp -a "$TXN_DIR/path$i" "${TXN_PATHS[$i]}" || rollback_ok=0
+      fi
+    done
+    if command -v crontab >/dev/null; then
+      if [ "$TXN_CRON_PRESENT" = 1 ]; then crontab "$TXN_DIR/cron" || rollback_ok=0
+      else crontab -r 2>/dev/null || true; fi
+    fi
+    [ "$INIT" != systemd ] || systemctl daemon-reload || rollback_ok=0
+    if [ "$TXN_ACTIVE" = 1 ]; then (svc_start) || rollback_ok=0; fi
+    if [ "$rollback_ok" = 1 ]; then warn "原配置和服务状态已恢复"
+    else warn "自动恢复未完成，备份保留在 $TXN_DIR，请检查 bfc log"; fi
+  fi
+  if [ "$rollback_ok" = 1 ]; then rm -rf "$TXN_DIR"; fi
+  exit "$status"
+}
+with_change_lock() (
+  need_root
+  mkdir /run/bfc-change.lock 2>/dev/null || die "另一个 bfc 变更正在进行；若上次被强制终止，请先核对服务和 /run/bfc-change.lock"
+  trap 'rmdir /run/bfc-change.lock' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  CHANGE_LOCK_HELD=1
+  "$@"
+)
+transaction() {
+  if [ "${CHANGE_LOCK_HELD:-0}" = 1 ]; then run_transaction "$@"
+  else with_change_lock run_transaction "$@"; fi
+}
+run_transaction() (
+  set -e
+  umask 077
+  TXN_READY=0; TXN_ACTIVE=0; TXN_CRON_PRESENT=0
+  TXN_ADDED_FW=; TXN_REMOVED_FW=
+  TXN_DIR=$(mktemp -d) || die "创建恢复备份目录失败"
+  trap 'transaction_end $?' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  TXN_PATHS=("$DIR" "$BIN" "$CMD" /etc/systemd/system/bfc.service /etc/init.d/bfc
+    /etc/systemd/system/multi-user.target.wants/bfc.service /etc/runlevels/default/bfc)
+  for i in "${!TXN_PATHS[@]}"; do
+    if [ -e "${TXN_PATHS[$i]}" ] || [ -L "${TXN_PATHS[$i]}" ]; then cp -a "${TXN_PATHS[$i]}" "$TXN_DIR/path$i"; fi
+  done
+  if command -v crontab >/dev/null && crontab -l > "$TXN_DIR/cron" 2>/dev/null; then TXN_CRON_PRESENT=1; fi
+  svc_active 2>/dev/null && TXN_ACTIVE=1
+  TXN_READY=1
+  "$@"
+)
+apply_change() {
+  local mode=$1 script=${2:-}
+  install_deps
+  discover_addresses
+  # 只在真实变更中停服，预览始终只读。
+  svc_stop
+  plan_ports
+  if needs_cert && port_used 80 tcp; then die "TCP 80 已被占用，无法完成证书验证；请先释放该端口"; fi
+  if [ "$mode" != modify ]; then install_singbox; fi
+  gen_secrets
+  write_config
+  write_outputs
+  svc_install
+  fw_open_all
+  svc_start
+  fw_prune
+  save_state
+  if [ -n "$script" ]; then install -m 755 "$script" "$CMD"; fi
+}
+
 do_install() {
   need_root; detect_os
   [ "$PM" = none ] && warn "没识别出包管理器（$OS_NAME），继续尝试"
   load_state
+  remember_listeners
   parse_flags "$@"
-  # 重新配置时先停掉自己的服务，免得把自己占的端口当成冲突
-  [ -r $STATE ] && svc_active 2>/dev/null && svc_stop
-  plan_ports
-  print_plan
-  if [ "${DRY_RUN:-0}" = 1 ]; then echo; info "这是预览，没有改动系统"; return; fi
-  [ -n "$DOMAIN" ] && port_used 80 tcp && warn "80 端口被占用，证书可能申请不下来。先停掉占用 80 端口的程序（比如 nginx）"
+  if [ "${DRY_RUN:-0}" = 1 ]; then
+    plan_ports; print_plan
+    echo; info "这是预览，没有改动系统"; return
+  fi
   step "开始安装"
-  mkdir -p $DIR && chmod 700 $DIR
-  install_deps
-  install_singbox
-  gen_secrets
-  write_config
-  svc_install
-  fw_close_all; fw_open_all
-  svc_start
+  local script= status
+  if [ -f "$0" ] && [ "$(readlink -f "$0")" != "$CMD" ]; then script=$0
+  elif [ ! -x "$CMD" ]; then # 用 bash <(curl ...) 这类方式运行时 $0 不是文件，另下一份装成 bfc
+    script=$(mktemp)
+    curl -fsSL --max-time 30 -o "$script" "$SCRIPT_URL" && grep -q '^SCRIPT_VERSION=' "$script" || { warn "bfc 管理命令没装上"; script=; }
+  fi
+  transaction install_change "$script"
+  status=$?; [ "$status" = 0 ] || return "$status"
+  load_state
   apply_sysctl
   make_swap
+  save_state || die "系统优化状态保存失败"
   check_time
-  save_state
-  write_outputs
-  # 把脚本本身装成 bfc 命令
-  if [ "$(readlink -f "$0" 2>/dev/null)" != $CMD ]; then
-    if [ -f "$0" ]; then install -m 755 "$0" $CMD
-    else curl -fsSL --max-time 30 -o $CMD $SCRIPT_URL && chmod 755 $CMD || warn "bfc 管理命令没装上"; fi
-  fi
   echo; info "${G}${B}安装完成${N}"
   show_info
+}
+install_change() {
+  mkdir -p "$DIR"; chmod 700 "$DIR"
+  apply_change install "$1"
 }
 
 do_uninstall() {
@@ -772,42 +991,43 @@ do_uninstall() {
 
 do_update() {
   need_root
-  local tmp; tmp=$(mktemp /usr/local/bin/.bfc.XXXXXX)
+  local tmp status
+  tmp=$(mktemp /usr/local/bin/.bfc.XXXXXX)
   info "下载最新脚本"
-  curl -fsSL --max-time 30 -o "$tmp" $SCRIPT_URL || curl -fsSL --max-time 30 -o "$tmp" $SCRIPT_URL_BACKUP || die "下载失败"
-  grep -q '^SCRIPT_VERSION=' "$tmp" || die "下载到的文件不对，已停止"
-  # 先写临时文件再改名替换，正在运行的旧脚本不受影响
-  chmod 755 "$tmp" && mv -f "$tmp" $CMD
-  info "脚本已更新到 $(grep -m1 '^SCRIPT_VERSION=' $CMD | cut -d'"' -f2)，正在用新版本重新应用配置"
-  exec bash $CMD reload
+  if ! { curl -fsSL --max-time 30 -o "$tmp" "$SCRIPT_URL" || curl -fsSL --max-time 30 -o "$tmp" "$SCRIPT_URL_BACKUP"; }; then rm -f "$tmp"; die "下载失败"; fi
+  if ! grep -q '^SCRIPT_VERSION=' "$tmp" || ! bash -n "$tmp"; then rm -f "$tmp"; die "下载到的脚本无效，保留原版本"; fi
+  # 新脚本验证、服务重启和输出全部成功后，才替换管理命令。
+  bash "$tmp" reload "$tmp"
+  status=$?; rm -f "$tmp"
+  return "$status"
 }
 
-do_reload() { # 不改协议，按当前脚本重新生成配置（更新后用）
+do_reload() {
   need_root; detect_os; load_state
-  [ -r $STATE ] || die "还没有安装"
-  install_singbox; gen_secrets; write_config; svc_install; svc_start; save_state; write_outputs
+  [ -r "$STATE" ] || die "还没有安装"
+  transaction apply_change reload "${1:-}"
+  local status=$?; [ "$status" = 0 ] || return "$status"
   info "已重新应用，sing-box $SB_VERSION"
 }
 
-do_modify() { # add / del
+do_modify() {
   need_root; detect_os; load_state
-  [ -r $STATE ] || die "还没有安装，先运行部署命令"
-  local mode=$1; shift
-  if [ $mode = add ]; then
+  [ -r "$STATE" ] || die "还没有安装，先运行部署命令"
+  local mode=$1 status; shift
+  remember_listeners
+  if [ "$mode" = add ]; then
     ADD_MODE=1 parse_flags "$@"
   else
     [ $# -gt 0 ] || die "写要删除的协议，例如：bfc del tuic"
     local p; for p in "$@"; do
       p=${p#--}; [ -n "${P_NAME[$p]:-}" ] || die "没有这个协议：$p"
-      set_port $p ""
+      set_port "$p" ""
     done
     [ -n "$(enabled_protos)" ] || die "至少要留一个协议。要全部删除请用 bfc uninstall"
   fi
-  svc_stop
-  plan_ports
-  gen_secrets; write_config; svc_install
-  fw_close_all; fw_open_all
-  svc_start; save_state; write_outputs
+  if [ "${DRY_RUN:-0}" = 1 ]; then plan_ports; print_plan; return; fi
+  transaction apply_change modify
+  status=$?; [ "$status" = 0 ] || return "$status"
   show_info
 }
 
@@ -830,17 +1050,17 @@ EOF
   case $c in
     1) show_info ;; 2) show_qr ;;
     3) echo "可选：${PROTOS[*]}"; read -r -p "要增加的协议（可写多个，空格隔开，例如 tuic anytls）：" x
-       local args=(); for p in $x; do args+=("--${p#--}"); done; do_modify add "${args[@]}" ;;
-    4) read -r -p "要删除的协议：" x; do_modify del $x ;;
-    5) need_root; svc_start; info "已重启" ;;
+       local args=(); for p in $x; do args+=("--${p#--}"); done; main add "${args[@]}" ;;
+    4) read -r -p "要删除的协议：" x; main del $x ;;
+    5) main restart ;;
     6) svc_log ;;
-    7) do_update ;;
-    8) do_uninstall ;;
+    7) main update ;;
+    8) main uninstall ;;
     *) ;;
   esac
 }
 
-main() {
+dispatch() {
   case "${1:-}" in
     info) show_info ;;
     qr) show_qr ;;
@@ -849,12 +1069,26 @@ main() {
     stop) need_root; detect_os; svc_stop; info "已停止" ;;
     log|logs) detect_os; svc_log "${2:-80}" ;;
     update) do_update ;;
-    reload) do_reload ;;
+    reload) do_reload "${2:-}" ;;
     uninstall) shift; for a in "$@"; do [ "$a" = -y ] && YES=1; done; do_uninstall ;;
     version|-v) echo "bfc $SCRIPT_VERSION / sing-box $SB_VERSION" ;;
     help|-h|--help) usage ;;
     "") if [ "$(basename "$0")" = bfc ]; then menu; else do_install; fi ;;
     *) do_install "$@" ;;
+  esac
+}
+
+main() {
+  local arg
+  case "${1:-}" in
+    info|qr|log|logs|version|-v|help|-h|--help|update) dispatch "$@" ;;
+    "") if [ "$(basename "$0")" = bfc ]; then menu; else with_change_lock dispatch "$@"; fi ;;
+    add|-*)
+      for arg in "$@"; do
+        if [ "$arg" = --dry-run ]; then dispatch "$@"; return; fi
+      done
+      with_change_lock dispatch "$@" ;;
+    *) with_change_lock dispatch "$@" ;;
   esac
 }
 

@@ -1,5 +1,12 @@
 # 测试共用：用本机 sing-box 当客户端，经指定出站打开网页
 # test_client '<出站 JSON，ShadowTLS 是两个对象用逗号连起来>'
+assert_deleted() {
+  local name=$1 proto=$2
+  docker exec "$name" bfc del "$proto" || return 1
+  docker exec "$name" sh -c '! grep -q "^socks5://" /etc/bfc/links.txt' || return 1
+  docker exec "$name" cat /etc/bfc/config.json | jq -e --arg p "$proto" 'all(.inbounds[]; .tag != $p)' >/dev/null
+}
+
 test_client() {
   local ob=$1 tag cfg pid ok=1
   tag=$(echo "[$ob]" | jq -r '.[0].tag')

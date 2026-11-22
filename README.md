@@ -22,9 +22,9 @@ curl -fsSLo bfc.sh https://bufanche.com/deploy.sh && sh bfc.sh --reality --hy2
 - **锁定版本。** sing-box 版本和每个架构的 sha256 写死在脚本里，对不上就停止安装。
 - **密钥在服务器上生成。** 网页只拼命令，不发请求，也不收集任何数据。
 - **不碰别的东西。** 不换内核、不改 SSH；端口被占就换一个；服务名是 `bfc`，和你自己装的 sing-box 不冲突。
-- **能撤回。** 改过的防火墙规则、sysctl、swap 都记在状态文件里，`bfc uninstall` 逐项撤回。
+- **能撤回。** 本版只记录自己新增的防火墙规则，卸载时保留原有规则。安装、增删协议、更新失败时恢复原配置、程序和服务状态。旧版未标记归属的防火墙规则会保留并提示手动核对。
 - **重跑结果不变。** 同一条命令再跑一次，密钥和端口沿用上次的，节点链接不变。
-- **代理用户碰不到本机。** 默认拒绝经代理访问服务器本机和内网地址。
+- **代理用户碰不到本机。** 默认拒绝内网地址、配置生成时的本机接口地址和探测到的公网地址。服务器新增或更换 IP 后需执行 `bfc reload` 刷新限制。
 
 ## 管理
 
@@ -39,6 +39,10 @@ curl -fsSLo bfc.sh https://bufanche.com/deploy.sh && sh bfc.sh --reality --hy2
 | `bfc uninstall` | 卸载 |
 
 全部选项：`sh bfc.sh --help`
+
+使用 `--domain` 时，TCP 80 必须保持空闲，并在云安全组中持续放行，供证书签发和续期。脚本会在已开启的系统防火墙里放行 TCP 80。指定 `--ipv6` 时若没有可用公网 IPv6，会明确报错。
+
+`--dry-run` 不会停止服务或写文件；没有 bash 的系统会提示先安装 bash，本次不自动安装。配置变更通过 `/run/bfc-change.lock` 避免同时执行；正常退出会清理锁，被 `kill -9` 或断电中断时需先核对服务及残留备份再处理锁。软件包安装、BBR 和 swap 等系统优化不在配置回滚范围内。
 
 ## 文件
 
@@ -56,6 +60,16 @@ curl -fsSLo bfc.sh https://bufanche.com/deploy.sh && sh bfc.sh --reality --hy2
 ```bash
 tests/docker-test.sh debian:12 ubuntu:24.04 alpine:3.22
 ```
+
+针对性回归和真实网络测试（都在隔离容器中运行）：
+
+```bash
+docker run --rm -v "$PWD:/src:ro" ubuntu:24.04 bash /src/tests/regression-test.sh
+docker run --rm --cap-add NET_ADMIN -v "$PWD:/src:ro" alpine:3.22 sh -c 'apk add --no-cache bash curl >/dev/null && bash /src/tests/safety-test.sh'
+docker run --rm --cap-add NET_ADMIN -v "$PWD:/src:ro" bfc-systemd-ubuntu bash /src/tests/firewall-test.sh
+```
+
+最后一项使用 `tests/init-test.sh` 构建的、包含 UFW 和 iptables 的 Ubuntu 测试镜像。安全测试覆盖本机公网 IPv4、IPv6、IPv4 映射地址、域名解析、正常公网访问，以及配置、输出、启动和更新失败恢复。
 
 ## 许可
 

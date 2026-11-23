@@ -24,7 +24,7 @@ fi
 
 set -uo pipefail
 
-SCRIPT_VERSION="1.0.1"
+SCRIPT_VERSION="1.0.2"
 SB_VERSION="1.14.4"
 # sing-box 官方发布的 musl 静态版（所有发行版通用），sha256 由本项目下载后核对写入
 declare -A SB_SHA256=(
@@ -945,6 +945,7 @@ apply_change() {
   # 只在真实变更中停服，预览始终只读。
   svc_stop
   plan_ports
+  if [ "$mode" = install ]; then print_plan; step "开始安装"; fi
   if needs_cert && port_used 80 tcp; then die "TCP 80 已被占用，无法完成证书验证；请先释放该端口"; fi
   if [ "$mode" != modify ]; then install_singbox; fi
   gen_secrets
@@ -969,7 +970,6 @@ do_install() {
     plan_ports; print_plan
     echo; info "这是预览，没有改动系统"; return
   fi
-  step "开始安装"
   local script= status
   if [ -f "$0" ] && [ "$(readlink -f "$0")" != "$CMD" ]; then script=$0
   elif [ ! -x "$CMD" ]; then # 用 bash <(curl ...) 这类方式运行时 $0 不是文件，另下一份装成 bfc

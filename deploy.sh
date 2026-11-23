@@ -24,7 +24,7 @@ fi
 
 set -uo pipefail
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.0.1"
 SB_VERSION="1.14.4"
 # sing-box 官方发布的 musl 静态版（所有发行版通用），sha256 由本项目下载后核对写入
 declare -A SB_SHA256=(
@@ -67,6 +67,21 @@ info() { echo "${G}▸${N} $*"; }
 warn() { echo "${Y}! $*${N}" >&2; }
 die()  { echo "${R}✗ $*${N}" >&2; exit 1; }
 step() { echo; echo "${B}$*${N}"; }
+banner() { # 窗口不到 68 列时只显示一行字，免得折行
+  local cols; cols=$(tput cols 2>/dev/null || echo 80)
+  if [ "${cols:-80}" -ge 68 ]; then
+    printf '%s' "$G"; printf '%s\n' \
+'██████╗ ██╗   ██╗███████╗ █████╗ ███╗   ██╗ ██████╗██╗  ██╗███████╗' \
+'██╔══██╗██║   ██║██╔════╝██╔══██╗████╗  ██║██╔════╝██║  ██║██╔════╝' \
+'██████╔╝██║   ██║█████╗  ███████║██╔██╗ ██║██║     ███████║█████╗  ' \
+'██╔══██╗██║   ██║██╔══╝  ██╔══██║██║╚██╗██║██║     ██╔══██║██╔══╝  ' \
+'██████╔╝╚██████╔╝██║     ██║  ██║██║ ╚████║╚██████╗██║  ██║███████╗' \
+'╚═════╝  ╚═════╝ ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═══╝ ╚═════╝╚═╝  ╚═╝╚══════╝'; printf '%s' "$N"
+    echo "           ${B}不翻车一键部署 v$SCRIPT_VERSION${N} · bufanche.com"
+  else
+    echo "${G}${B}不翻车一键部署 v$SCRIPT_VERSION${N} · bufanche.com"
+  fi
+}
 
 usage() {
   cat <<EOF
@@ -944,6 +959,7 @@ apply_change() {
 }
 
 do_install() {
+  banner
   need_root; detect_os
   [ "$PM" = none ] && warn "没识别出包管理器（$OS_NAME），继续尝试"
   load_state
@@ -1036,7 +1052,8 @@ menu() {
   [ -r $STATE ] || { usage; return; }
   detect_os
   local st; svc_active && st="${G}运行中${N}" || st="${R}已停止${N}"
-  echo "${B}不翻车一键部署 v$SCRIPT_VERSION${N}  sing-box $SB_VERSION  状态：$st"
+  banner
+  echo "sing-box $SB_VERSION  状态：$st"
   echo "协议：$(for p in $(enabled_protos); do echo -n "${P_NAME[$p]} "; done)"
   cat <<EOF
 

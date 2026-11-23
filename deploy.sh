@@ -22,9 +22,10 @@ if [ -z "${BASH_VERSION:-}" ]; then
   exec bash "$0" "$@"
 fi
 
+set +o posix  # RHEL 8 系的 sh 是 POSIX 模式的 bash 4.4，不认 < <(...) 这类写法
 set -uo pipefail
 
-SCRIPT_VERSION="1.0.3"
+SCRIPT_VERSION="1.0.4"
 SB_VERSION="1.14.4"
 # sing-box 官方发布的 musl 静态版（所有发行版通用），sha256 由本项目下载后核对写入
 declare -A SB_SHA256=(

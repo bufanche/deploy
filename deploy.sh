@@ -24,7 +24,7 @@ fi
 
 set -uo pipefail
 
-SCRIPT_VERSION="1.0.2"
+SCRIPT_VERSION="1.0.3"
 SB_VERSION="1.14.4"
 # sing-box 官方发布的 musl 静态版（所有发行版通用），sha256 由本项目下载后核对写入
 declare -A SB_SHA256=(
@@ -60,6 +60,18 @@ declare -A P_NET=(
 # 都是 TLS 1.3 + H2 + X25519MLKEM768、不跳转、证书链不长的网站。每台机器随机选一个。
 SNI_LIST=(www.nike.com www.sony.co.jp www.honda.co.jp www.nissan.co.jp www.agoda.com
   www.zara.com www.walmart.com www.starbucks.com www.dailymotion.com www.costco.com)
+
+# REALITY 目标网站：用 bufanche.com 每周扫描合格的名单随机取一个；下载不到就用上面内置的
+SNI_URL="https://bufanche.com/reality-sni.txt"
+pick_sni() {
+  local list=() h
+  while read -r h; do
+    h=${h%$'\r'}; [[ $h == \#* ]] && continue
+    if valid_domain "$h"; then list+=("$h"); fi
+  done < <(curl -fsSL --max-time 8 "$SNI_URL" 2>/dev/null || true)
+  [ ${#list[@]} -ge 5 ] || list=("${SNI_LIST[@]}")
+  echo "${list[RANDOM % ${#list[@]}]}"
+}
 
 # ---------- 输出 ----------
 if [ -t 1 ]; then R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[1m'; D=$'\e[2m'; N=$'\e[0m'; else R= G= Y= B= D= N=; fi
@@ -368,7 +380,7 @@ gen_secrets() {
   [ -n "$SNELL_PSK" ] || SNELL_PSK=$($BIN generate rand 16 --hex)
   [ -n "$R_SID" ] || R_SID=$($BIN generate rand 8 --hex)
   [ -n "$WS_PATH" ] || WS_PATH=/$($BIN generate rand 6 --hex)
-  [ -n "$SNI" ] || SNI=${SNI_LIST[RANDOM % ${#SNI_LIST[@]}]}
+  [ -n "$SNI" ] || SNI=$(pick_sni)
   [ -n "$CERT_SNI" ] || CERT_SNI=$SNI
   if [ -z "$R_PRIV" ]; then
     local kp; kp=$($BIN generate reality-keypair)
